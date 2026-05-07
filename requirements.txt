@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+python-dotenv
+pydantic
+sqlparse
+presidio-analyzer
+presidio-anonymizer
+spacy
