@@ -1,16 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel
 from datetime import timedelta
-from time import perf_counter
+import time
 
 from app.schemas.prompt_schema import PromptRequest
 from app.services.redactor import redact_sensitive_data
-from app.services.sql_validator import validate_sql
 from app.services.audit_logger import create_audit_log
+from app.services.sql_firewall.engine import process_sql
+
 from app.db.database import SessionLocal
 from app.db.models import User
+
 from app.services.auth import (
     get_password_hash,
     verify_password,
@@ -27,21 +29,23 @@ router = APIRouter()
 
 def get_db():
     db = SessionLocal()
+
     try:
         yield db
+
     finally:
         db.close()
 
 # =========================================================
-# REQUEST SCHEMAS
+# AUTH SCHEMAS
 # =========================================================
 
 class UserCreate(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 # =========================================================
-# AUTHENTICATION ROUTES
+# AUTH ROUTES
 # =========================================================
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
@@ -49,13 +53,9 @@ def register_user(
     user: UserCreate,
     db: Session = Depends(get_db)
 ):
-    normalized_email = user.email.strip().lower()
-
-    existing_user = (
-        db.query(User)
-        .filter(User.email == normalized_email)
-        .first()
-    )
+    existing_user = db.query(User).filter(
+        User.email == user.email
+    ).first()
 
     if existing_user:
         raise HTTPException(
@@ -66,7 +66,7 @@ def register_user(
     hashed_password = get_password_hash(user.password)
 
     new_user = User(
-        email=normalized_email,
+        email=user.email,
         hashed_password=hashed_password
     )
 
@@ -83,13 +83,9 @@ def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db)
 ):
-    normalized_email = form_data.username.strip().lower()
-
-    user = (
-        db.query(User)
-        .filter(User.email == normalized_email)
-        .first()
-    )
+    user = db.query(User).filter(
+        User.email == form_data.username
+    ).first()
 
     if not user:
         raise HTTPException(
@@ -113,10 +109,7 @@ def login_for_access_token(
     )
 
     access_token = create_access_token(
-        data={
-            "sub": user.email,
-            "user_id": user.id
-        },
+        data={"sub": user.email},
         expires_delta=access_token_expires
     )
 
@@ -126,31 +119,58 @@ def login_for_access_token(
     }
 
 # =========================================================
-# SCAN SERVICE ORCHESTRATION
+# CORE SCAN PROCESSOR
 # =========================================================
 
-def process_scan(prompt: str):
+def process_scan(prompt: str, role: str):
+
+    # -----------------------------------------------------
+    # 1. PII REDACTION
+    # -----------------------------------------------------
+
     redaction_result = redact_sensitive_data(prompt)
 
-    sql_risks = validate_sql(prompt)
-
     risk_score = redaction_result["risk_score"]
+
     risk_level = redaction_result["risk_level"]
 
-    # SQL injection automatically escalates severity
-    if sql_risks:
+    # -----------------------------------------------------
+    # 2. SQL FIREWALL ENGINE
+    # -----------------------------------------------------
+
+    sql_result = process_sql(
+        prompt=prompt,
+        role=role
+    )
+
+    sql_risks = sql_result["risks"]
+
+    final_query = sql_result.get("final_query")
+
+    # -----------------------------------------------------
+    # 3. SQL POLICY OVERRIDE
+    # -----------------------------------------------------
+
+    if not sql_result["allowed"]:
         risk_score = 1.0
         risk_level = "CRITICAL_SQL"
 
+    # -----------------------------------------------------
+    # 4. FINAL RESPONSE
+    # -----------------------------------------------------
+
     return {
         **redaction_result,
-        "sql_risks": sql_risks,
         "risk_score": risk_score,
-        "risk_level": risk_level
+        "risk_level": risk_level,
+        "sql_risks": sql_risks,
+        "sql_allowed": sql_result["allowed"],
+        "sql_decision_reason": sql_result["reason"],
+        "final_query": final_query
     }
 
 # =========================================================
-# PROTECTED ROUTES
+# PROTECTED SCAN ROUTE
 # =========================================================
 
 @router.post("/scan")
@@ -159,40 +179,65 @@ def scan_prompt(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    start_time = perf_counter()
 
-    result = process_scan(request.prompt)
+    start_time = time.time()
+
+    # -----------------------------------------------------
+    # RUN SECURITY PIPELINE
+    # -----------------------------------------------------
+
+    result = process_scan(
+        prompt=request.prompt,
+        role=current_user.role
+    )
 
     processing_time_ms = round(
-        (perf_counter() - start_time) * 1000,
+        (time.time() - start_time) * 1000,
         2
     )
 
-    # Persist audit log
+    # -----------------------------------------------------
+    # AUDIT LOGGING
+    # -----------------------------------------------------
+
     create_audit_log(
-        db=db,
-        user_id=current_user.id,
-        original_prompt=result["original_prompt"],
-        redacted_prompt=result["redacted_prompt"],
-        risk_score=result["risk_score"],
-        risk_level=result["risk_level"],
-        detected_entities=result["detected_entities"],
-        entity_details=result["entity_details"],
-        sql_risks=result["sql_risks"]
-    )
+    db=db,
 
-    return {
-        **result,
-        "scanned_by": current_user.email,
-        "processing_time_ms": processing_time_ms
-    }
+    user_id=current_user.id,
 
-@router.get("/me")
-def get_current_user_profile(
-    current_user: User = Depends(get_current_user)
-):
-    return {
-        "id": current_user.id,
-        "email": current_user.email
-    }
+    original_prompt=result["original_prompt"],
 
+    redacted_prompt=result["redacted_prompt"],
+
+    risk_score=result["risk_score"],
+
+    risk_level=result["risk_level"],
+
+    detected_entities=", ".join(
+        result["detected_entities"]
+    ),
+
+    entity_details=result["entity_details"],
+
+    # =================================================
+    # SQL FIREWALL AUDIT
+    # =================================================
+
+    sql_allowed=result["sql_allowed"],
+
+    sql_risks=result["sql_risks"],
+
+    sql_decision_reason=result["sql_decision_reason"],
+
+    final_query=result.get("final_query")
+)
+
+    # -----------------------------------------------------
+    # RESPONSE
+    # -----------------------------------------------------
+
+    result["scanned_by"] = current_user.email
+
+    result["processing_time_ms"] = processing_time_ms
+
+    return result

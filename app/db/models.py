@@ -6,126 +6,92 @@ from sqlalchemy import (
     DateTime,
     Float,
     JSON,
-    ForeignKey
+    ForeignKey,
+    Boolean
 )
 
 from sqlalchemy.orm import relationship
+
 from datetime import datetime
 
 from app.db.database import Base
 
-# =========================================================
-# USER MODEL
-# =========================================================
 
 class User(Base):
+
     __tablename__ = "users"
 
-    id = Column(
-        Integer,
-        primary_key=True,
-        index=True
-    )
+    id = Column(Integer, primary_key=True, index=True)
 
-    email = Column(
-        String,
-        unique=True,
-        index=True,
-        nullable=False
-    )
+    email = Column(String, unique=True, index=True, nullable=False)
 
-    hashed_password = Column(
-        String,
-        nullable=False
-    )
+    hashed_password = Column(String, nullable=False)
 
-    role = Column(
-        String,
-        default="engineer",
-        nullable=False
-    )
+    role = Column(String, default="analyst")
 
-    created_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        nullable=False
-    )
-
-    # Relationship to audit logs
     logs = relationship(
         "AuditLog",
-        back_populates="user",
-        cascade="all, delete-orphan"
+        back_populates="user"
     )
 
-# =========================================================
-# AUDIT LOG MODEL
-# =========================================================
 
 class AuditLog(Base):
+
     __tablename__ = "audit_logs"
 
-    id = Column(
-        Integer,
-        primary_key=True,
-        index=True
-    )
+    id = Column(Integer, primary_key=True, index=True)
+
+    # =====================================================
+    # USER RELATIONSHIP
+    # =====================================================
 
     user_id = Column(
         Integer,
-        ForeignKey("users.id"),
-        nullable=False,
-        index=True
+        ForeignKey("users.id")
     )
 
-    original_prompt = Column(
-        Text,
-        nullable=False
-    )
-
-    redacted_prompt = Column(
-        Text,
-        nullable=False
-    )
-
-    risk_score = Column(
-        Float,
-        default=0.0,
-        nullable=False
-    )
-
-    risk_level = Column(
-        String,
-        nullable=False
-    )
-
-    detected_entities = Column(
-        JSON,
-        default=list,
-        nullable=False
-    )
-
-    entity_details = Column(
-        JSON,
-        default=list,
-        nullable=False
-    )
-
-    sql_risks = Column(
-        JSON,
-        default=list,
-        nullable=False
-    )
-
-    created_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        nullable=False,
-        index=True
-    )
-
-    # Relationship back to user
     user = relationship(
         "User",
         back_populates="logs"
+    )
+
+    # =====================================================
+    # PROMPT DATA
+    # =====================================================
+
+    original_prompt = Column(Text)
+
+    redacted_prompt = Column(Text)
+
+    # =====================================================
+    # PII SECURITY
+    # =====================================================
+
+    risk_score = Column(Float, default=0.0)
+
+    risk_level = Column(String)
+
+    detected_entities = Column(Text)
+
+    entity_details = Column(JSON)
+
+    # =====================================================
+    # SQL FIREWALL AUDIT
+    # =====================================================
+
+    sql_allowed = Column(Boolean, default=True)
+
+    sql_risks = Column(JSON)
+
+    sql_decision_reason = Column(JSON)
+
+    final_query = Column(Text)
+
+    # =====================================================
+    # TIMESTAMP
+    # =====================================================
+
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow
     )

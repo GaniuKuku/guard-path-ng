@@ -1,9 +1,7 @@
 from sqlalchemy.orm import Session
+
 from app.db.models import AuditLog
 
-# =========================================================
-# AUDIT LOGGER SERVICE
-# =========================================================
 
 def create_audit_log(
     db: Session,
@@ -12,28 +10,38 @@ def create_audit_log(
     redacted_prompt: str,
     risk_score: float,
     risk_level: str,
-    detected_entities: list,
+    detected_entities: str,
     entity_details: list,
-    sql_risks: list = None
+
+    # SQL FIREWALL
+    sql_allowed: bool,
+    sql_risks: list,
+    sql_decision_reason: list,
+    final_query: str = None
 ):
-    """
-    Creates an immutable audit log entry for GuardPath scans.
-    Designed to be DB-agnostic and future scalable.
-    """
 
     log = AuditLog(
         user_id=user_id,
+
         original_prompt=original_prompt,
         redacted_prompt=redacted_prompt,
+
         risk_score=risk_score,
         risk_level=risk_level,
+
         detected_entities=detected_entities,
         entity_details=entity_details,
-        sql_risks=sql_risks or []
+
+        sql_allowed=sql_allowed,
+        sql_risks=sql_risks,
+        sql_decision_reason=sql_decision_reason,
+        final_query=final_query
     )
 
     db.add(log)
+
     db.commit()
+
     db.refresh(log)
 
     return log

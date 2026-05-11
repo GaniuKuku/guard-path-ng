@@ -1,6 +1,8 @@
 fastapi
 uvicorn[standard]
 
+sqlglot
+
 sqlalchemy
 psycopg2-binary
 
