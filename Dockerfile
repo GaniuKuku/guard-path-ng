@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 # =========================================================
-# SYSTEM DEPENDENCIES (required for spaCy + Presidio)
+# SYSTEM DEPENDENCIES
 # =========================================================
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # =========================================================
-# INSTALL PYTHON DEPENDENCIES
+# PYTHON DEPENDENCIES
 # =========================================================
 COPY requirements.txt .
 
@@ -24,21 +24,21 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # =========================================================
-# DOWNLOAD SPACY MODEL 
+# SPACY MODEL
 # =========================================================
 RUN python -m spacy download en_core_web_sm
 
 # =========================================================
-# COPY APPLICATION CODE
+# COPY SOURCE CODE
 # =========================================================
 COPY . .
 
 # =========================================================
-# ENVIRONMENT SETTINGS
+# ENV
 # =========================================================
 ENV PYTHONUNBUFFERED=1
 
 # =========================================================
-# START SERVER
+# RUN SERVER (PRODUCTION MODE)
 # =========================================================
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

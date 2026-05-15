@@ -2,13 +2,15 @@ from fastapi import FastAPI
 
 from app.api.routes import router
 
-from app.db.database import engine
-from app.db.models import Base
-
-Base.metadata.create_all(bind=engine)
-
+# =========================================================
+# FASTAPI APP INITIALIZATION
+# =========================================================
 app = FastAPI(
-    title="GuardPath-NG"
+    title="GuardPath-NG",
+    version="1.0.0"
 )
 
+# =========================================================
+# ROUTES
+# =========================================================
 app.include_router(router)
