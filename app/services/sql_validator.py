@@ -62,14 +62,6 @@ def extract_tables(ast):
 
 
 # =========================================================
-# EXTRACT VALID COLUMNS ONLY
-# IGNORE:
-# - aliases
-# - computed fields
-# - aggregate aliases
-# - derived labels
-# =========================================================
-# =========================================================
 # EXTRACT REAL COLUMNS ONLY
 # Ignores:
 # - table aliases (c, s)
@@ -295,9 +287,14 @@ def validate_sql_against_schema(
         }
 
     # -----------------------------------------------------
-    # EXTRACT TABLES
+    # EXTRACT TABLES & TABLE ALIASES
     # -----------------------------------------------------
     used_tables = extract_tables(ast)
+
+    table_aliases = set()
+    for table in ast.find_all(exp.Table):
+        if table.alias:
+            table_aliases.add(table.alias.lower())
 
     # -----------------------------------------------------
     # VALIDATE TABLES
@@ -359,7 +356,7 @@ def validate_sql_against_schema(
 
     # -----------------------------------------------------
     # IDENTIFIER VALIDATION
-    # Ignore aliases dynamically
+    # Ignore aliases and table aliases dynamically
     # -----------------------------------------------------
     for identifier in identifiers:
 
@@ -367,6 +364,7 @@ def validate_sql_against_schema(
             identifier not in all_allowed_columns
             and identifier not in aliases
             and identifier not in used_tables
+            and identifier not in table_aliases
         ):
 
             # ignore numeric GROUP BY refs
