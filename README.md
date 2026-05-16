@@ -1,4 +1,5 @@
 # GuardPath
+![logo](assets/guardpath_logo.png)
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![FastAPI](https://img.shields.io/badge/FastAPI-API-green)
