@@ -12,12 +12,14 @@ from app.services.schema_reader import (
     get_schema_object
 )
 
+from app.services.prompt_builder import build_system_prompt
+
 import sqlparse
 import logging
+import re
 
 router = APIRouter()
 llm_service = LLMService()
-
 logger = logging.getLogger("guardpath")
 
 DEBUG_MODE = False
@@ -26,302 +28,236 @@ DEBUG_MODE = False
 # =========================================================
 # SQL FORMATTER
 # =========================================================
-def format_sql_query(sql: str) -> str:
-    return sqlparse.format(
-        sql,
-        reindent=True,
-        keyword_case="upper"
-    )
+def format_sql_query(sql: str):
+    return sqlparse.format(sql, reindent=True, keyword_case="upper")
 
 
 # =========================================================
-# FIELD EXTRACTION
+# INTENT DETECTOR
 # =========================================================
-def extract_requested_fields(prompt: str):
-    fields = []
+def contains_dangerous_intent(prompt: str):
     text = prompt.lower()
 
-    COMMON_FIELDS = [
-        "email", "phone", "address", "password",
-        "salary", "ssn", "credit_card", "dob", "name"
+    dangerous_keywords = [
+        "drop", "delete", "truncate",
+        "alter", "update", "insert"
     ]
 
-    for field in COMMON_FIELDS:
-        if field in text:
-            fields.append(field)
+    for keyword in dangerous_keywords:
+        if re.search(rf"\b{keyword}\b", text):
+            return True, keyword
 
-    return list(set(fields))
+    return False, None
 
 
 # =========================================================
-# UNIFIED SCHEMA SCOPE RESOLVER (🔥 FIX)
+# FIELD EXTRACTION (kept lightweight)
+# =========================================================
+def extract_requested_fields(prompt: str):
+    text = prompt.lower()
+
+    FIELD_ALIASES = {
+        "email": ["email", "gmail", "mail"],
+        "phone": ["phone", "mobile", "telephone"],
+        "address": ["address", "location"],
+        "salary": ["salary", "income", "wage"],
+        "dob": ["dob", "date of birth"]
+    }
+
+    detected = set()
+
+    for canonical, aliases in FIELD_ALIASES.items():
+        for a in aliases:
+            if a in text:
+                detected.add(canonical)
+
+    return list(detected)
+
+
+# =========================================================
+# SEMANTIC CHECK
+# =========================================================
+def field_exists(field: str, all_columns: set):
+    field = field.lower()
+
+    if field in all_columns:
+        return True
+
+    for col in all_columns:
+        if field in col.replace("_", " "):
+            return True
+
+    return False
+
+
+# =========================================================
+# SCHEMA SCOPE RESOLVER
 # =========================================================
 def resolve_schema_scope(prompt: str, schema: dict):
 
     prompt_lower = prompt.lower()
-    matched_tables = set()
+    matched = set()
 
     for table_name, table_data in schema["tables"].items():
 
-        table_lower = table_name.lower()
+        if table_name.lower() in prompt_lower:
+            matched.add(table_name)
 
-        # direct table mention
-        if table_lower in prompt_lower:
-            matched_tables.add(table_name)
-
-        # column mention
         for col in table_data["columns"]:
             col_name = col["name"].lower()
 
             if col_name in prompt_lower:
-                matched_tables.add(table_name)
+                matched.add(table_name)
 
-    # fallback: if nothing matched, return ALL tables safely
-    if not matched_tables:
-        matched_tables = set(schema["tables"].keys())
+            if col_name.replace("_", " ") in prompt_lower:
+                matched.add(table_name)
 
-    return list(matched_tables)
+    if not matched:
+        matched = set(schema["tables"].keys())
+
+    return list(matched)
 
 
 # =========================================================
-# CORE PIPELINE
+# MAIN PIPELINE
 # =========================================================
 async def process_scan(prompt: str, role: str):
 
-    # -----------------------------------------------------
     # 1. REDACTION
-    # -----------------------------------------------------
     redaction_result = redact_sensitive_data(prompt)
-
     safe_prompt = redaction_result["redacted_prompt"]
-    risk_score = redaction_result.get("risk_score", 0)
-    risk_level = redaction_result.get("risk_level", "LOW")
 
-    logger.info(f"[REDACTED]: {safe_prompt}")
-
-    # -----------------------------------------------------
     # 2. LOAD SCHEMA
-    # -----------------------------------------------------
     schema = get_schema_object()
 
     all_columns = {
         col["name"].lower()
-        for table in schema["tables"].values()
-        for col in table["columns"]
+        for t in schema["tables"].values()
+        for col in t["columns"]
     }
 
-    # -----------------------------------------------------
-    # 3. FIELD CHECK (SOFT BLOCK)
-    # -----------------------------------------------------
-    requested_fields = extract_requested_fields(safe_prompt)
+    scoped_tables = resolve_schema_scope(prompt, schema)
 
-    missing_fields = [
-        f for f in requested_fields
-        if f not in all_columns
+    # 3. DANGEROUS INTENT BLOCK
+    dangerous, keyword = contains_dangerous_intent(prompt)
+    if dangerous:
+        return {
+            **redaction_result,
+            "risk_level": "CRITICAL_SQL",
+            "sql_allowed": False,
+            "sql_decision_reason": f"Blocked {keyword}",
+            "final_query": None,
+            "scoped_tables": scoped_tables
+        }
+
+    # 4. FIELD CHECK
+    requested = extract_requested_fields(prompt)
+
+    missing = [
+        f for f in requested
+        if not field_exists(f, all_columns)
     ]
 
-    if missing_fields:
-
-        scoped_tables = resolve_schema_scope(safe_prompt, schema)
-
+    if missing:
         return {
             **redaction_result,
-            "original_prompt": prompt,
-            "redacted_prompt": safe_prompt,
-
-            "risk_score": 0.9,
             "risk_level": "SCHEMA_MISSING_FIELDS",
-
             "sql_allowed": False,
-            "sql_risks": [],
-
-            "sql_decision_reason":
-                f"Database does not contain: {missing_fields}",
-
+            "sql_decision_reason": f"Missing fields: {missing}",
             "final_query": None,
-
-            # 🔥 FIXED: always resolved, never empty/None
-            "scoped_tables": scoped_tables,
-
-            "message":
-                f"Your database does not contain {', '.join(missing_fields)}"
+            "scoped_tables": scoped_tables
         }
 
-    # -----------------------------------------------------
-    # 4. SCHEMA SCOPING (PRIMARY)
-    # -----------------------------------------------------
-    scoped_schema_obj = get_relevant_schema(safe_prompt)
+    # 5. GET SCOPED SCHEMA
+    scoped_schema = get_relevant_schema(prompt)
 
-    if not scoped_schema_obj or not scoped_schema_obj.get("tables"):
-
-        scoped_tables = resolve_schema_scope(safe_prompt, schema)
-
+    if not scoped_schema or not scoped_schema.get("tables"):
         return {
             **redaction_result,
-            "original_prompt": prompt,
-            "redacted_prompt": safe_prompt,
-
-            "risk_score": 1.0,
             "risk_level": "NO_SCHEMA_MATCH",
-
             "sql_allowed": False,
-            "sql_risks": [],
-
-            "sql_decision_reason": "No matching schema found",
-
             "final_query": None,
-
-            "scoped_tables": scoped_tables,
-
-            "message": "Request does not match database schema"
+            "scoped_tables": scoped_tables
         }
 
-    # -----------------------------------------------------
-    # 5. FORMAT SCHEMA
-    # -----------------------------------------------------
-    scoped_schema_text = format_schema_for_llm(scoped_schema_obj)
+    schema_text = format_schema_for_llm(scoped_schema)
 
-    system_prompt = f"""
-You are a SQL generator.
+    # 6. BUILD PROMPT (🔥 MOVED OUT)
+    system_prompt = build_system_prompt(
+        dialect="postgres",
+        schema_text=schema_text
+    )
 
-STRICT RULES:
-- Output ONLY SQL
-- No explanations
-- No markdown
-- Use ONLY provided schema
-- Do NOT invent tables or columns
-- NEVER use SELECT *
-- Always end query with semicolon
+    # 7. LLM CALL
+    llm_response = await llm_service.generate(
+        prompt=safe_prompt,
+        system_prompt=system_prompt,
+        temperature=0.1
+    )
 
-DATABASE SCHEMA:
------------------
-{scoped_schema_text}
------------------
-"""
-
-    # -----------------------------------------------------
-    # 6. LLM
-    # -----------------------------------------------------
-    try:
-        llm_response = await llm_service.generate(
-            prompt=safe_prompt,
-            system_prompt=system_prompt,
-            temperature=0.1
-        )
-
-        generated_sql = (
-            llm_response.get("text")
-            or llm_response.get("content")
-            or ""
-        ).strip()
-
-    except Exception as e:
-        return {
-            **redaction_result,
-            "risk_score": 1.0,
-            "risk_level": "LLM_ERROR",
-            "sql_allowed": False,
-            "sql_risks": [],
-            "sql_decision_reason": str(e),
-            "final_query": None,
-            "scoped_tables": []
-        }
+    generated_sql = (
+        llm_response.get("text")
+        or llm_response.get("content")
+        or ""
+    ).strip()
 
     if not generated_sql:
         return {
             **redaction_result,
-            "risk_score": 1.0,
             "risk_level": "LLM_EMPTY",
             "sql_allowed": False,
-            "sql_risks": [],
-            "sql_decision_reason": "Empty SQL",
             "final_query": None,
-            "scoped_tables": []
+            "scoped_tables": scoped_tables
         }
 
-    # -----------------------------------------------------
-    # 7. FORMAT
-    # -----------------------------------------------------
+    # 8. FORMAT
     formatted_sql = format_sql_query(generated_sql)
 
-    # -----------------------------------------------------
-    # 8. VALIDATION
-    # -----------------------------------------------------
-    schema_validation = validate_sql_against_schema(formatted_sql)
+    # 9. VALIDATE
+    validation = validate_sql_against_schema(formatted_sql)
 
-    if not schema_validation.get("valid"):
+    if not validation.get("valid"):
         return {
             **redaction_result,
-            "risk_score": 1.0,
             "risk_level": "SCHEMA_VIOLATION",
             "sql_allowed": False,
-            "sql_risks": [schema_validation.get("error")],
-            "sql_decision_reason": schema_validation.get("error"),
+            "sql_decision_reason": validation.get("error"),
             "final_query": None,
-            "scoped_tables": []
+            "scoped_tables": scoped_tables
         }
 
-    # -----------------------------------------------------
-    # 9. FIREWALL
-    # -----------------------------------------------------
-    sql_result = process_sql(prompt=formatted_sql, role=role)
+    # 10. FIREWALL
+    result = process_sql(prompt=formatted_sql, role=role)
 
-    if not sql_result.get("allowed", False):
+    if not result.get("allowed"):
         return {
             **redaction_result,
-            "risk_score": 1.0,
             "risk_level": "CRITICAL_SQL",
             "sql_allowed": False,
-            "sql_risks": sql_result.get("risks", []),
-            "sql_decision_reason": sql_result.get("reason", ""),
+            "sql_decision_reason": result.get("reason"),
             "final_query": None,
-            "scoped_tables": []
+            "scoped_tables": scoped_tables
         }
 
-    # -----------------------------------------------------
-    # 10. FINAL RESPONSE
-    # -----------------------------------------------------
-    response = {
+    # 11. SUCCESS
+    return {
         **redaction_result,
-        "original_prompt": prompt,
-        "redacted_prompt": safe_prompt,
-
-        "risk_score": risk_score,
-        "risk_level": risk_level,
-
+        "risk_level": "LOW",
         "sql_allowed": True,
-        "sql_risks": sql_result.get("risks", []),
-        "sql_decision_reason": sql_result.get("reason", ""),
-
+        "sql_risks": result.get("risks", []),
+        "sql_decision_reason": result.get("reason", ""),
         "final_query": formatted_sql,
-
-        # 🔥 ALWAYS CONSISTENT NOW
-        "scoped_tables": list(scoped_schema_obj["tables"].keys()),
-
+        "scoped_tables": list(scoped_schema["tables"].keys()),
         "message": "SQL query approved"
     }
 
-    if DEBUG_MODE:
-        response["system_prompt"] = system_prompt
 
-    return response
-
-
-# =========================================================
 # ROUTES
-# =========================================================
 @router.post("/scan")
 async def scan_prompt(request: PromptRequest):
-    return await process_scan(prompt=request.prompt, role="analyst")
+    return await process_scan(request.prompt, "analyst")
 
 
 @router.get("/debug/schema")
 async def debug_schema():
     return {"schema": get_schema_json()}
-
-
-@router.post("/debug/relevant-schema")
-async def debug_relevant_schema(request: PromptRequest):
-    return {
-        "relevant_schema": get_relevant_schema(request.prompt)
-    }

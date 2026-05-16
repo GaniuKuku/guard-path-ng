@@ -62,23 +62,110 @@ def extract_tables(ast):
 
 
 # =========================================================
-# EXTRACT COLUMNS
+# EXTRACT VALID COLUMNS ONLY
+# IGNORE:
+# - aliases
+# - computed fields
+# - aggregate aliases
+# - derived labels
+# =========================================================
+# =========================================================
+# EXTRACT REAL COLUMNS ONLY
+# Ignores:
+# - table aliases (c, s)
+# - select aliases (total_profit)
 # =========================================================
 def extract_columns(ast):
 
     columns = set()
 
+    # collect aliases first
+    table_aliases = set()
+    select_aliases = set()
+
+    # -----------------------------------------------------
+    # TABLE ALIASES
+    # FROM customer c
+    # JOIN sales s
+    # -----------------------------------------------------
+    for table in ast.find_all(exp.Table):
+
+        if table.alias:
+            table_aliases.add(
+                table.alias.lower()
+            )
+
+    # -----------------------------------------------------
+    # SELECT ALIASES
+    # SUM(profit) AS total_profit
+    # -----------------------------------------------------
+    for alias in ast.find_all(exp.Alias):
+
+        if alias.alias:
+            select_aliases.add(
+                alias.alias.lower()
+            )
+
+    # -----------------------------------------------------
+    # REAL COLUMNS ONLY
+    # -----------------------------------------------------
     for column in ast.find_all(exp.Column):
 
-        if column.name:
-            columns.add(column.name.lower())
+        column_name = column.name.lower()
+
+        # skip table aliases
+        if column_name in table_aliases:
+            continue
+
+        # skip select aliases
+        if column_name in select_aliases:
+            continue
+
+        columns.add(column_name)
 
     return list(columns)
 
 
 # =========================================================
+# EXTRACT ALIASES
+# Dynamic alias extraction across ALL SQL
+# =========================================================
+def extract_aliases(ast):
+
+    aliases = set()
+
+    # SELECT x AS alias
+    for alias in ast.find_all(exp.Alias):
+
+        if alias.alias:
+            aliases.add(alias.alias.lower())
+
+    return aliases
+
+
+# =========================================================
+# EXTRACT ORDER/GROUP REFERENCES
+# Handles:
+# ORDER BY total_profit
+# GROUP BY order_month
+# =========================================================
+def extract_identifier_references(ast):
+
+    identifiers = set()
+
+    for node in ast.walk():
+
+        # identifiers used in ORDER BY / GROUP BY
+        if isinstance(node, exp.Identifier):
+
+            if node.name:
+                identifiers.add(node.name.lower())
+
+    return identifiers
+
+
+# =========================================================
 # SEMANTIC PLACEHOLDER VALIDATION
-# Dynamic across ALL databases
 # =========================================================
 def validate_placeholder_mappings(sql: str, prompt: str):
 
@@ -89,7 +176,6 @@ def validate_placeholder_mappings(sql: str, prompt: str):
 
     for placeholder, semantic_type in PLACEHOLDER_TYPES.items():
 
-        # only validate placeholders present in prompt
         if placeholder.lower() not in prompt_lower:
             continue
 
@@ -98,8 +184,8 @@ def validate_placeholder_mappings(sql: str, prompt: str):
             for item in semantic_map.get(semantic_type, [])
         ]
 
-        # no semantic columns exist in DB
         if not allowed_columns:
+
             return {
                 "valid": False,
                 "error": (
@@ -114,6 +200,7 @@ def validate_placeholder_mappings(sql: str, prompt: str):
         )
 
         if not matched:
+
             return {
                 "valid": False,
                 "error": (
@@ -190,6 +277,11 @@ def validate_sql_against_schema(
         for table, meta in schema["tables"].items()
     }
 
+    all_allowed_columns = set()
+
+    for cols in allowed_columns_by_table.values():
+        all_allowed_columns.update(cols)
+
     # -----------------------------------------------------
     # PARSE SQL
     # -----------------------------------------------------
@@ -203,13 +295,12 @@ def validate_sql_against_schema(
         }
 
     # -----------------------------------------------------
-    # EXTRACT TABLES + COLUMNS
+    # EXTRACT TABLES
     # -----------------------------------------------------
     used_tables = extract_tables(ast)
-    used_columns = extract_columns(ast)
 
     # -----------------------------------------------------
-    # TABLE VALIDATION
+    # VALIDATE TABLES
     # -----------------------------------------------------
     invalid_tables = []
 
@@ -229,22 +320,63 @@ def validate_sql_against_schema(
         }
 
     # -----------------------------------------------------
+    # EXTRACT VALID PHYSICAL COLUMNS
+    # -----------------------------------------------------
+    used_columns = extract_columns(ast)
+
+    # -----------------------------------------------------
+    # EXTRACT DYNAMIC ALIASES
+    # -----------------------------------------------------
+    aliases = extract_aliases(ast)
+
+    # -----------------------------------------------------
+    # EXTRACT IDENTIFIER REFERENCES
+    # ORDER BY total_profit
+    # GROUP BY order_month
+    # etc
+    # -----------------------------------------------------
+    identifiers = extract_identifier_references(ast)
+
+    # -----------------------------------------------------
+    # REMOVE ALIASES FROM IDENTIFIER CHECK
+    # -----------------------------------------------------
+    identifiers = {
+        item
+        for item in identifiers
+        if item not in aliases
+    }
+
+    # -----------------------------------------------------
     # COLUMN VALIDATION
+    # ONLY REAL SCHEMA COLUMNS
     # -----------------------------------------------------
     invalid_columns = []
 
     for col in used_columns:
 
-        found = False
-
-        for table_cols in allowed_columns_by_table.values():
-
-            if col.lower() in table_cols:
-                found = True
-                break
-
-        if not found:
+        if col.lower() not in all_allowed_columns:
             invalid_columns.append(col)
+
+    # -----------------------------------------------------
+    # IDENTIFIER VALIDATION
+    # Ignore aliases dynamically
+    # -----------------------------------------------------
+    for identifier in identifiers:
+
+        if (
+            identifier not in all_allowed_columns
+            and identifier not in aliases
+            and identifier not in used_tables
+        ):
+
+            # ignore numeric GROUP BY refs
+            if identifier.isdigit():
+                continue
+
+            invalid_columns.append(identifier)
+
+    # remove duplicates
+    invalid_columns = list(set(invalid_columns))
 
     if invalid_columns:
 
@@ -258,7 +390,6 @@ def validate_sql_against_schema(
 
     # -----------------------------------------------------
     # SEMANTIC VALIDATION
-    # Dynamic PII mapping protection
     # -----------------------------------------------------
     semantic_validation = validate_placeholder_mappings(
         sql=sql,
